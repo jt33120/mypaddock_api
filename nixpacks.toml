@@ -1,0 +1,12 @@
+# Force Railway to use Python and run FastAPI from the src folder
+
+[phases.setup]
+nixPkgs = ["python311"]
+
+[phases.install]
+cmds = [
+  "pip install -r requirements.txt"
+]
+
+[start]
+cmd = "uvicorn src.inference:app --host 0.0.0.0 --port $PORT"
