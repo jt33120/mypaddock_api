@@ -1,7 +1,7 @@
 fastapi
 uvicorn[standard]
-supabase-py
+supabase
 python-dotenv
-openai # if you import openai
-numpy # if you import numpy
-pydantic # if you import it directly
+echo "openai" >> requirements.txt
+echo "numpy" >> requirements.txt
+echo "pydantic" >> requirements.txt
