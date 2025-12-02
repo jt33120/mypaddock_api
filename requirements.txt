@@ -2,6 +2,6 @@ fastapi
 uvicorn[standard]
 supabase
 python-dotenv
-echo "openai" >> requirements.txt
-echo "numpy" >> requirements.txt
-echo "pydantic" >> requirements.txt
+openai
+numpy
+pydantic
