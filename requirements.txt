@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+supabase-py
+python-dotenv
+openai # if you import openai
+numpy # if you import numpy
+pydantic # if you import it directly
