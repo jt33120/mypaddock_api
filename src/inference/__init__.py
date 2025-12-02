@@ -10,10 +10,16 @@ from src.inference.refresh import refresh_user_vehicles
 # 1) Create FastAPI app ONCE
 app = FastAPI()
 
+origins = [
+    "http://localhost:3000",
+    # add your deployed frontend URL here, for example:
+    # "https://mypaddock.vercel.app",
+]
+
 # 2) Add CORS middleware (so your React app can call this API)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # later you can restrict to ["http://localhost:5173"]
+    allow_origins=origins,  # later you can restrict to ["http://localhost:5173"]
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
