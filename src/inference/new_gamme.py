@@ -7,9 +7,8 @@ from typing import Dict, Any
 from openai import OpenAI
 from src.data.supabase_client import get_supabase_client
 
-# Adjust model name if you use something else
+# LLM model
 OPENAI_MODEL = "gpt-4.1-mini"
-
 openai_client = OpenAI()
 
 
@@ -28,13 +27,13 @@ def _fetch_gamme_specs_from_llm(
     trim: str,
 ) -> Dict[str, Any]:
     """
-    Call OpenAI to get:
-      - msrp_usd_v0
-      - engine_displacement (L or cc, we normalize to liters)
+    Ask OpenAI for:
+      - msrp_usd_v0        -> V0
+      - engine_displacement_l -> engine_displacement
       - hp
-      - engine_configuration (e.g. inline, V, flat)
+      - engine_configuration
       - number_of_cylinders
-      - supply_by_country (JSON object, best-effort)
+      - supply_by_country (JSON dict, later aggregated to bigint for DB)
     """
 
     messages = [
@@ -42,21 +41,20 @@ def _fetch_gamme_specs_from_llm(
             "role": "system",
             "content": (
                 "You are an automotive data assistant. "
-                "Given make, model, year and trim, you estimate technical specs and MSRP. "
-                "If you are not reasonably confident, you must set fields to null instead of guessing wildly."
+                "Given make, model, year and trim, estimate specs and MSRP. "
+                "If uncertain, answer null instead of hallucinating."
             ),
         },
         {
             "role": "user",
             "content": (
-                "From the following vehicle information, estimate the requested fields.\n"
-                "Return a STRICT JSON object with exactly these keys:\n"
-                "  msrp_usd_v0 (number or null),\n"
-                "  engine_displacement_l (number in liters or null),\n"
-                "  hp (number or null),\n"
-                "  engine_configuration (string or null),\n"
-                "  number_of_cylinders (integer or null),\n"
-                "  supply_by_country (object mapping 2-letter country codes to approximate supply levels or null).\n\n"
+                "Return STRICT JSON with EXACT keys:\n"
+                "  msrp_usd_v0,\n"
+                "  engine_displacement_l,\n"
+                "  hp,\n"
+                "  engine_configuration,\n"
+                "  number_of_cylinders,\n"
+                "  supply_by_country (object: country_code -> supply number).\n\n"
                 f"make: {make}\n"
                 f"model: {model}\n"
                 f"year: {year}\n"
@@ -72,16 +70,14 @@ def _fetch_gamme_specs_from_llm(
         temperature=0.2,
     )
 
-    raw_content = response.choices[0].message.content or "{}"
+    raw = response.choices[0].message.content or "{}"
 
     try:
-        data = json.loads(raw_content)
+        data = json.loads(raw)
     except json.JSONDecodeError:
-        # Worst case, return empty structure
         data = {}
 
-    # Normalize and ensure all keys exist
-    specs: Dict[str, Any] = {
+    return {
         "msrp_usd_v0": data.get("msrp_usd_v0"),
         "engine_displacement_l": data.get("engine_displacement_l"),
         "hp": data.get("hp"),
@@ -89,8 +85,6 @@ def _fetch_gamme_specs_from_llm(
         "number_of_cylinders": data.get("number_of_cylinders"),
         "supply_by_country": data.get("supply_by_country"),
     }
-
-    return specs
 
 
 def update_gamme_row_from_llm(
@@ -100,42 +94,68 @@ def update_gamme_row_from_llm(
     trim: str,
 ) -> Dict[str, Any]:
     """
-    Main entrypoint:
+    Create or update the 'gammes' row with:
+      - gamme_id = MAKEMODELTRIMYEAR (TEXT)
+      - Columns: V0, engine_displacement, hp, engine_configuration,
+                 number_of_cylinders, supply_by_country
 
-    - Build gamme_id = MAKEMODELTRIMYEAR
-    - Ask OpenAI for specs (MSRP, engine, supply)
-    - Upsert into 'gammes' table with the new values
-
-    Returns the dict that was upserted.
+    Assumptions:
+      - gammes.gamme_id is TEXT (NOT NULL, PRIMARY KEY / UNIQUE)
+      - gammes has columns: gamme_id, make, model, year, trim,
+                            V0, engine_displacement, hp,
+                            engine_configuration, number_of_cylinders,
+                            supply_by_country (BIGINT)
     """
+
     supabase = get_supabase_client()
+    year_int = int(year)
 
-    gamme_id = _build_gamme_id(make, model, year, trim)
-    specs = _fetch_gamme_specs_from_llm(make, model, year, trim)
+    gamme_id = _build_gamme_id(make, model, year_int, trim)
 
-    # Map directly to your 'gammes' table column names.
-    # Make sure these column names match your schema.
-    payload = {
+    # 1) Fetch specs from LLM
+    specs = _fetch_gamme_specs_from_llm(make, model, year_int, trim)
+
+    # 2) Adapt supply_by_country (dict) -> bigint for DB
+    raw_supply = specs.get("supply_by_country")
+    supply_agg = None
+
+    if isinstance(raw_supply, dict):
+        try:
+            supply_agg = int(
+                sum(v for v in raw_supply.values() if isinstance(v, (int, float)))
+            )
+        except Exception:
+            supply_agg = None
+    elif isinstance(raw_supply, (int, float, str)):
+        try:
+            supply_agg = int(raw_supply)
+        except Exception:
+            supply_agg = None
+
+    # 3) Build payload, aligned with your DB columns
+    payload: Dict[str, Any] = {
         "gamme_id": gamme_id,
         "make": make,
         "model": model,
-        "year": int(year),
+        "year": year_int,
         "trim": trim,
-        "msrp_usd_v0": specs.get("msrp_usd_v0"),
-        "engine_displacement_l": specs.get("engine_displacement_l"),
+        "V0": specs.get("msrp_usd_v0"),
+        "engine_displacement": specs.get("engine_displacement_l"),
         "hp": specs.get("hp"),
         "engine_configuration": specs.get("engine_configuration"),
         "number_of_cylinders": specs.get("number_of_cylinders"),
-        # Assuming `supply_by_country` is a JSONB column in Supabase
-        "supply_by_country": specs.get("supply_by_country"),
+        "supply_by_country": supply_agg,
     }
 
-    # Use upsert so it works whether the gamme already exists or not
-    (
+    # 4) Upsert on gamme_id (TEXT)
+    result = (
         supabase.table("gammes")
         .upsert(payload, on_conflict="gamme_id")
         .execute()
     )
 
-    return payload
+    # Attach raw specs for debugging in notebook
+    payload["_raw_specs"] = specs
+    payload["_supabase_result"] = result.data
 
+    return payload
