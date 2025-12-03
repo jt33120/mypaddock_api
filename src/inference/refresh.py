@@ -17,6 +17,7 @@ def refresh_user_vehicles(user_id: str) -> List[Dict[str, Any]]:
       - For each vehicle, check the latest entry in vehicle_timeseries
       - If already valued today -> skip
       - Otherwise -> run ValuatorEngine and upsert a new timeseries point
+      - Also update vehicles.current_value with the new valuation
 
     Returns a list of dicts with:
       {
@@ -72,6 +73,14 @@ def refresh_user_vehicles(user_id: str) -> List[Dict[str, Any]]:
             value=valuation.price_usd,
             mileage=mileage,
             date=today,
+        )
+
+        # 5) Update vehicles.current_value with the new price
+        (
+            client.table("vehicles")
+            .update({"current_value": valuation.price_usd})
+            .eq("vehicle_id", vehicle_id)
+            .execute()
         )
 
         results.append(
