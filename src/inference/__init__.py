@@ -20,7 +20,11 @@ origins = [
 # 2) Add CORS middleware (so your React app can call this API)
 app.add_middleware(
     CORSMiddleware,
+<<<<<<< HEAD
     allow_origins=origins,  # later you can restrict to ["http://localhost:5173"]
+=======
+    allow_origins=["*"],  # later you can restrict to ["http://localhost:5173"]
+>>>>>>> 1334872 (Add ML training pipeline, parametric model, inference updater)
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
