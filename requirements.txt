@@ -7,3 +7,4 @@ numpy==1.26.4
 pydantic
 pandas
 requests
+pytorch==2.3.1
