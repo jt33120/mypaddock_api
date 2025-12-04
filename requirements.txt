@@ -8,3 +8,4 @@ pandas
 requests
 torch==2.2.2 --extra-index-url https://download.pytorch.org/whl/cpu
 
+
