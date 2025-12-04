@@ -1,37 +1,40 @@
-from typing import List, Optional
+from typing import List, Optional, Any, Dict
+import os
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from src.inference.refresh import refresh_user_vehicles
-from src.inference.new_gamme import update_gamme_row_from_llm 
+from src.inference.new_gamme import update_gamme_row_from_llm
+# 👇 ADJUST THIS IMPORT PATH to where your incremental_trainer.py really is
+from src.nnm.incremental_trainer import run_daily_nnm_training
 
 
 # 1) Create FastAPI app ONCE
 app = FastAPI()
 
+# CORS
 origins = [
     "http://localhost:3000",
     # add your deployed frontend URL here, for example:
     # "https://mypaddock.vercel.app",
 ]
 
-# 2) Add CORS middleware (so your React app can call this API)
 app.add_middleware(
     CORSMiddleware,
-<<<<<<< HEAD
-    allow_origins=origins,  # later you can restrict to ["http://localhost:5173"]
-=======
-    allow_origins=["*"],  # later you can restrict to ["http://localhost:5173"]
->>>>>>> 1334872 (Add ML training pipeline, parametric model, inference updater)
+    # pick one behavior and remove the git conflict markers
+    allow_origins=origins,   # or ["*"] if you want fully open
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# 🔐 Secret for training endpoint (set in Railway env vars)
+TRAINING_SECRET = os.getenv("TRAINING_SECRET", "")
 
-# 3) Request/Response models for the endpoint
+
+# 3) Request/Response models for the endpoints
 class RefreshRequest(BaseModel):
     user_id: str
 
@@ -41,12 +44,18 @@ class RefreshResponse(BaseModel):
     price_usd: float
     comment: Optional[str] = None
 
+
 class NewGammeRequest(BaseModel):
     make: str
     model: str
     year: int
     trim: Optional[str] = ""  # keep it simple, you can adjust
 
+
+class NNMTrainResponse(BaseModel):
+    status: str
+    since_date: str
+    details: Dict[str, Any]
 
 
 # 4) Endpoint that uses your refresh_user_vehicles() function
@@ -61,6 +70,7 @@ def valuation_refresh(req: RefreshRequest):
 
     results = refresh_user_vehicles(req.user_id)
     return results
+
 
 @app.post("/valuation/new_gamme")
 def valuation_new_gamme(req: NewGammeRequest):
@@ -83,3 +93,20 @@ def valuation_new_gamme(req: NewGammeRequest):
     except Exception as e:
         # log e on server side if you want more detail
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/nnm/train/daily", response_model=NNMTrainResponse)
+async def trigger_daily_nnm_training(
+    x_training_secret: Optional[str] = Header(default=None),
+):
+    """
+    Trigger the daily NNM incremental training.
+
+    Protected by the X-TRAINING-SECRET header so only your cron / admin
+    can call it.
+    """
+    if not TRAINING_SECRET or x_training_secret != TRAINING_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    result = run_daily_nnm_training()
+    return NNMTrainResponse(**result)
