@@ -1,8 +1,9 @@
 fastapi
 uvicorn[standard]
-supabase
+supabase-py
 python-dotenv
 openai
 numpy
 pydantic
 pandas
+torch==2.4.1
