@@ -1,11 +1,13 @@
-fastapi
-supabase
-python-dotenv
-openai
+--index-url https://download.pytorch.org/whl/cpu
+--extra-index-url https://pypi.org/simple
+
+torch==2.2.2
+
+fastapi==0.123.8
+supabase==2.25.0
+python-dotenv==1.2.1
+openai==2.8.1
 numpy==1.26.4
-pydantic
-pandas
-requests
-torch==2.2.2 --extra-index-url https://download.pytorch.org/whl/cpu
-
-
+pydantic==2.12.5
+pandas==2.3.3
+requests==2.32.5
