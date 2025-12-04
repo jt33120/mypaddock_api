@@ -3,7 +3,8 @@ uvicorn[standard]
 supabase-py
 python-dotenv
 openai
-numpy
+numpy==1.26.4
 pydantic
 pandas
+requests
 torch==2.4.1
