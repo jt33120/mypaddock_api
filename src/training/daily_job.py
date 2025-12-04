@@ -1,9 +1,10 @@
 # src/training/daily_job.py
 
 from datetime import date, timedelta
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from src.training.incremental_trainer import train_incremental_on_new_rows
+from src.data.supabase_client import get_supabase_client
 
 
 def run_daily_nnm_training() -> Dict[str, Any]:
@@ -26,21 +27,57 @@ def run_daily_nnm_training() -> Dict[str, Any]:
     return {
         "status": "ok",
         "since_date": since_date_str,
-        "details": result,
+        "details": result,  # this must be JSON-serializable (dict / list / primitives)
     }
+
+
+def log_training_run(payload: Dict[str, Any], error: Optional[str] = None) -> None:
+    """
+    Insert one row into nnm_training_runs so we can audit training.
+
+    details -> jsonb column
+    """
+    client = get_supabase_client()
+
+    status = "error" if error else payload.get("status", "ok")
+    since_date_str = payload.get("since_date")
+
+    # jsonb: we pass a dict directly
+    details_obj = payload.get("details", {}) or {}
+
+    insert_data = {
+        "status": status,
+        "since_date": since_date_str,
+        "details": details_obj,
+        "error_message": error,
+    }
+
+    resp = client.table("nnm_training_runs").insert(insert_data).execute()
+    print("Logged training run to nnm_training_runs:", resp)
 
 
 def main():
     """Entry point for Railway Cron."""
     print("=== Running Daily NNM Training Job ===")
 
+    # Default payload in case training fails before we get a real result
+    payload: Dict[str, Any] = {
+        "status": "started",
+        "since_date": (date.today() - timedelta(days=1)).isoformat(),
+        "details": {},
+    }
+
     try:
-        result = run_daily_nnm_training()
+        payload = run_daily_nnm_training()
         print("Training completed successfully.")
-        print(result)
+        print(payload)
+        log_training_run(payload)
     except Exception as e:
+        err_msg = str(e)
         print("Training failed with error:")
-        print(str(e))
+        print(err_msg)
+        # log failed run too
+        log_training_run(payload, error=err_msg)
         raise
 
 
