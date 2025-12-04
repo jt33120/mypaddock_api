@@ -1,9 +1,0 @@
-.git
-.notebooks
-notebooks
-__pycache__
-*.py[cod]
-.env
-.env.*
-README*
-*.ipynb
