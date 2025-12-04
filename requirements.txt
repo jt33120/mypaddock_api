@@ -1,6 +1,6 @@
 fastapi
 uvicorn[standard]
-supabase-py
+supabase
 python-dotenv
 openai
 numpy==1.26.4
