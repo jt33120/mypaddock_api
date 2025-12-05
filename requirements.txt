@@ -2,7 +2,7 @@
 --extra-index-url https://pypi.org/simple
 
 torch==2.2.2
-
+uvicorn[standard]
 fastapi==0.123.8
 supabase==2.25.0
 python-dotenv==1.2.1
