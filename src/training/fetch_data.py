@@ -73,21 +73,16 @@ def _fetch_mc_comparables_for_vehicle(
         "api_key": api_key,
         "vin": vin,
         "miles": mileage,
-        "dealer_type": dealer_type,
+        "dealer_type": dealer_type,   # 'independent'
         "rows": max_similars,
-        "make": make,
-        "model": model,
-        "year": year,
     }
-
-    if trim:
-        params["trim"] = trim
-
+    
     if zip_code:
         params["zip"] = zip_code
     else:
         params["city"] = city
         params["state"] = state
+
 
     # 🔍 NEW DEBUG LOG — prints everything sent to MC
     print(
