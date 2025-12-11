@@ -4,7 +4,7 @@ import json
 from typing import List, Optional, Any, Dict
 from openai import OpenAI
 
-from core.domain import VehicleInfo
+from src.core.domain import VehicleInfo
 
 
 def _extract_json_from_text(text: str) -> Any:
