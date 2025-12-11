@@ -4,7 +4,7 @@ from typing import Optional, List, Dict, Any
 
 from supabase import create_client, Client
 
-from core.domain import VehicleInfo, TaskHistory, TaskHistoryList
+from src.core.domain import VehicleInfo, TaskHistory, TaskHistoryList
 from config import SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
 
 
