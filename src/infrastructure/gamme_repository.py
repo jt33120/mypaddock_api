@@ -4,7 +4,7 @@ from typing import List, Dict, Any
 
 from supabase import create_client, Client
 
-from core.domain import VehicleInfo, MaintenanceTask
+from src.core.domain import VehicleInfo, MaintenanceTask
 from config import SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
 
 
