@@ -5,7 +5,7 @@ from typing import List, Dict, Any
 from supabase import create_client, Client
 
 from src.core.domain import VehicleInfo, MaintenanceTask
-from config import SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
+from src.config import SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
 
 
 def _build_gamme_id(vehicle: VehicleInfo) -> str:
