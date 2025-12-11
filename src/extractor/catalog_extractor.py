@@ -4,8 +4,8 @@ import json
 from typing import List, Any
 from openai import OpenAI
 
-from core.domain import VehicleInfo, MaintenanceTask
-from core.tasks_catalog import get_task_catalog
+from src.core.domain import VehicleInfo, MaintenanceTask
+from src.core.tasks_catalog import get_task_catalog
 
 
 def _extract_json_from_text(text: str) -> Any:
