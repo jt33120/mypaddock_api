@@ -7,6 +7,10 @@ from pydantic import BaseModel
 from src.inference.refresh import refresh_user_vehicles
 from src.inference.new_gamme import update_gamme_row_from_llm
 
+# ✅ NEW IMPORTS
+from src.infrastructure.vehicle_repository import get_or_init_vehicle_history
+from src.service.maintenance_from_receipt import process_receipt_for_history
+
 
 # 1) Create FastAPI app ONCE
 app = FastAPI()
@@ -44,6 +48,15 @@ class NewGammeRequest(BaseModel):
     trim: Optional[str] = ""
 
 
+# ✅ NEW REQUEST MODELS FOR MAINTENANCE
+class VehicleHistoryRequest(BaseModel):
+    vehicle_id: str
+
+
+class ReceiptHistoryRequest(BaseModel):
+    receipt_id: str
+
+
 # 3) Endpoints
 
 @app.post("/valuation/refresh", response_model=List[RefreshResponse])
@@ -74,3 +87,31 @@ def valuation_new_gamme(req: NewGammeRequest):
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ✅ NEW ENDPOINT: init / get vehicle history
+@app.post("/maintenance/init-history")
+def maintenance_init_history(req: VehicleHistoryRequest):
+    """
+    Ensure the vehicle history exists for this vehicle (idempotent).
+    """
+    if not req.vehicle_id:
+        raise HTTPException(status_code=400, detail="Missing vehicle_id")
+
+    try:
+        result = get_or_init_vehicle_history(req.vehicle_id)
+        return result
+    except Exception as e:
+        # Log or handle as you wish
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ✅ NEW ENDPOINT: process a receipt into history
+@app.post("/maintenance/process-receipt")
+def maintenance_process_receipt(req: ReceiptHistoryRequest):
+    """
+    Process a given receipt into the vehicle's maintenance history.
+    """
+    if not req.receipt_id:
+        raise HTTPException(status_code=400, detail="Missing receipt_id")
+
