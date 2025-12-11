@@ -4,7 +4,7 @@ from typing import Dict, Any, Optional, List
 
 from openai import OpenAI
 
-from config import OPENAI_API_KEY
+from src.config import OPENAI_API_KEY
 from src.core.domain import VehicleInfo, TaskHistory
 from src.infrastructure.vehicle_repository import (
     get_or_init_vehicle_history,
