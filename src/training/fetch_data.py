@@ -20,7 +20,7 @@ def _get_marketcheck_api_key() -> Optional[str]:
 
 def _fetch_mc_comparables_for_vehicle(
     base_row: Dict[str, Any],
-    max_similars: int = 5,
+    max_similars: int = 100,
 ) -> List[Dict[str, Any]]:
 
     api_key = _get_marketcheck_api_key()
