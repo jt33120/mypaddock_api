@@ -4,7 +4,7 @@ from typing import Optional, Dict, Any
 
 from supabase import create_client, Client
 
-from config import SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
+from src.config import SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
 
 
 def _get_supabase_client() -> Client:
