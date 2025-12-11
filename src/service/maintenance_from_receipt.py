@@ -5,14 +5,14 @@ from typing import Dict, Any, Optional, List
 from openai import OpenAI
 
 from config import OPENAI_API_KEY
-from core.domain import VehicleInfo, TaskHistory
-from infrastructure.vehicle_repository import (
+from src.core.domain import VehicleInfo, TaskHistory
+from src.infrastructure.vehicle_repository import (
     get_or_init_vehicle_history,
     update_vehicle_task_history,
 )
-from infrastructure.receipt_repository import fetch_receipt_by_id
-from infrastructure.gamme_repository import _build_gamme_id  # optional if needed
-from extractor.receipt_task_matcher import ReceiptTaskMatcher
+from src.infrastructure.receipt_repository import fetch_receipt_by_id
+from src.infrastructure.gamme_repository import _build_gamme_id  # optional if needed
+from src.extractor.receipt_task_matcher import ReceiptTaskMatcher
 
 
 MAINTENANCE_LIKE_CATEGORIES = {"Maintenance", "Repairs", "Mods"} 
