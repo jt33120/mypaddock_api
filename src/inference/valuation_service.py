@@ -6,9 +6,16 @@ from typing import Any, Dict, Optional
 import math
 import json
 import requests
+import os
+
+from openai import OpenAI
 
 from src.data.preprocessing import VEHICLE_FEATURES
-from src.config import MARKETCHECK_API_KEY  # <-- you'll define this in src/config
+from src.config import MARKETCHECK_API_KEY  # <-- define this in src/config
+
+
+# Read from env (recommended). You can also move this into src.config if you prefer.
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 
 @dataclass
@@ -27,19 +34,25 @@ class ValuatorEngine:
 
       GET /v2/predict/car/us/marketcheck_price/comparables
 
-    It returns:
-      - estimated price in USD (marketcheck_price)
-      - a short comment about what was used / assumed
+    Fallback:
+      If MarketCheck fails / returns 0 / returns missing info, uses an OpenAI prompt
+      to estimate a private-party US market value.
     """
 
     def __init__(
         self,
         base_url: str = "https://api.marketcheck.com",
+        openai_model: str = "gpt-4o-mini",
     ) -> None:
         if not MARKETCHECK_API_KEY:
             raise RuntimeError("MARKETCHECK_API_KEY missing in .env / src.config")
         self.api_key = MARKETCHECK_API_KEY
         self.base_url = base_url.rstrip("/")
+
+        if not OPENAI_API_KEY:
+            raise RuntimeError("OPENAI_API_KEY missing in environment")
+        self.llm = OpenAI(api_key=OPENAI_API_KEY)
+        self.openai_model = openai_model
 
     # ---------- Internal helpers ----------
 
@@ -111,12 +124,88 @@ class ValuatorEngine:
 
         resp = requests.get(url, params=params, timeout=10)
         if resp.status_code != 200:
-            # Let caller handle the error
             raise requests.HTTPError(
                 f"MarketCheck returned {resp.status_code}: {resp.text}",
                 response=resp,
             )
         return resp.json()
+
+    def _is_mc_data_usable(self, mc_data: Dict[str, Any]) -> bool:
+        """
+        Decide whether MarketCheck response contains enough info to trust.
+        We require a positive numeric marketcheck_price.
+        """
+        if not isinstance(mc_data, dict):
+            return False
+
+        price = mc_data.get("marketcheck_price")
+        try:
+            price_f = float(price)
+        except (TypeError, ValueError):
+            return False
+
+        if price_f <= 0:
+            return False
+
+        return True
+
+    def _llm_fallback_valuation(self, vehicle: Dict[str, Any], reason: str) -> ValuationResult:
+        """
+        Simple LLM-based fallback valuation (private-party, US).
+        Returns ONLY if MC fails / returns unusable data.
+        """
+        prompt = f"""
+You are an automotive valuation expert.
+
+Estimate a fair private-party market value in USD for the vehicle below.
+Return ONLY valid JSON with:
+- price_usd (number)
+- explanation (string)
+
+Vehicle data:
+{json.dumps(vehicle, ensure_ascii=False, indent=2)}
+
+Context:
+- Sale type: private party
+- Market: United States
+- Reason for fallback: {reason}
+"""
+
+        try:
+            resp = self.llm.chat.completions.create(
+                model=self.openai_model,
+                messages=[
+                    {"role": "system", "content": "You estimate used car values conservatively and realistically."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.2,
+            )
+
+            content = resp.choices[0].message.content or ""
+            parsed = json.loads(content)
+
+            price = float(parsed.get("price_usd", 0.0))
+            explanation = str(parsed.get("explanation", "LLM fallback valuation."))
+
+            if price <= 0:
+                return ValuationResult(
+                    price_usd=0.0,
+                    comment=f"LLM fallback returned non-positive price. Explanation: {explanation}",
+                    raw_marketcheck=None,
+                )
+
+            return ValuationResult(
+                price_usd=price,
+                comment=f"[LLM fallback] {explanation}",
+                raw_marketcheck=None,
+            )
+
+        except Exception as e:
+            return ValuationResult(
+                price_usd=0.0,
+                comment=f"LLM fallback failed: {e}",
+                raw_marketcheck=None,
+            )
 
     # ---------- Public API ----------
 
@@ -129,9 +218,15 @@ class ValuatorEngine:
           - mileage (miles)
           - dealer_type (we default to 'independent' if missing)
           - zip (location)
+
+        Fallback to LLM if:
+          - required fields are missing
+          - MarketCheck call errors
+          - MarketCheck returns 0 / invalid / missing marketcheck_price
         """
 
         if vehicle is None:
+            # You can keep this as a hard zero or also fallback — your choice.
             return ValuationResult(
                 price_usd=0.0,
                 comment="Vehicle not found in database.",
@@ -152,13 +247,9 @@ class ValuatorEngine:
             missing_fields.append("zip")
 
         if missing_fields:
-            return ValuationResult(
-                price_usd=0.0,
-                comment=(
-                    "Cannot call MarketCheck: missing required fields: "
-                    + ", ".join(missing_fields)
-                ),
-                raw_marketcheck=None,
+            return self._llm_fallback_valuation(
+                vehicle,
+                reason=f"Missing required fields for MarketCheck: {', '.join(missing_fields)}",
             )
 
         try:
@@ -169,10 +260,16 @@ class ValuatorEngine:
                 zip_code=zip_code,
             )
         except Exception as e:
-            return ValuationResult(
-                price_usd=0.0,
-                comment=f"MarketCheck Price API call failed: {e}",
-                raw_marketcheck=None,
+            return self._llm_fallback_valuation(
+                vehicle,
+                reason=f"MarketCheck Price API call failed: {e}",
+            )
+
+        # If response is missing / invalid price, fallback
+        if not self._is_mc_data_usable(mc_data):
+            return self._llm_fallback_valuation(
+                vehicle,
+                reason="MarketCheck returned missing/invalid/zero marketcheck_price",
             )
 
         # Parse response
@@ -181,10 +278,7 @@ class ValuatorEngine:
         comps = mc_data.get("comparables", {}) or {}
         num_comps = comps.get("num_found") or len(comps.get("listings", []) or [])
 
-        try:
-            price_float = float(price) if price is not None else 0.0
-        except (TypeError, ValueError):
-            price_float = 0.0
+        price_float = float(price)
 
         comment_parts = [
             f"Price from MarketCheck Price Premium for VIN {vin}.",
