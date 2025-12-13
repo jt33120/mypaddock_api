@@ -7,14 +7,12 @@ import math
 import json
 import requests
 import os
+import re
 
 from openai import OpenAI
 
-from src.data.preprocessing import VEHICLE_FEATURES
 from src.config import MARKETCHECK_API_KEY  # <-- define this in src/config
 
-
-# Read from env (recommended). You can also move this into src.config if you prefer.
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 
@@ -29,14 +27,12 @@ class ValuatorEngine:
     """
     MarketCheck-based valuation engine.
 
-    Uses MarketCheck's MarketCheck Price (comparables) endpoint to estimate
-    the vehicle's value:
-
+    Primary:
       GET /v2/predict/car/us/marketcheck_price/comparables
 
     Fallback:
-      If MarketCheck fails / returns 0 / returns missing info, uses an OpenAI prompt
-      to estimate a private-party US market value.
+      If MarketCheck fails / returns unusable data, use OpenAI to estimate a
+      private-party (used) US market value.
     """
 
     def __init__(
@@ -57,7 +53,7 @@ class ValuatorEngine:
     # ---------- Internal helpers ----------
 
     def _safe_get(self, data: Dict[str, Any], key: str) -> str:
-        """Convert None / NaN to 'unknown' (kept in case you still use VEHICLE_FEATURES somewhere)."""
+        """Convert None / NaN to 'unknown'."""
         v = data.get(key, None)
         if v is None:
             return "unknown"
@@ -65,42 +61,39 @@ class ValuatorEngine:
             return "unknown"
         return str(v)
 
+    # Supabase schema: vin/mileage/zip
     def _extract_vin(self, vehicle: Dict[str, Any]) -> Optional[str]:
         vin = vehicle.get("vin")
-        if vin:
-            return str(vin)
-        return None
-
+        if not vin:
+            return None
+        return str(vin).strip()
 
     def _extract_miles(self, vehicle: Dict[str, Any]) -> Optional[int]:
         mileage = vehicle.get("mileage")
         if mileage is None:
             return None
-    
         try:
             miles = int(mileage)
         except (TypeError, ValueError):
             return None
-    
         return miles if miles >= 0 else None
 
     def _extract_zip(self, vehicle: Dict[str, Any]) -> Optional[str]:
-        zip_code = vehicle.get("zip")
-        if zip_code:
-            return str(zip_code)
-        return None
-
+        z = vehicle.get("zip")
+        if not z:
+            return None
+        return str(z).strip()
 
     def _extract_dealer_type(self, vehicle: Dict[str, Any]) -> str:
         """
-        MarketCheck requires dealer_type, but for private / 3rd-party valuations
-        we can default to 'independent' if we don't have better info.
+        MarketCheck requires dealer_type. Your prior code used "independent".
+        If you're valuing used/private-party-ish listings, "used" is fine
+        if MarketCheck accepts it. If you see MC errors, switch back to "independent".
         """
         v = vehicle.get("dealer_type")
-        if isinstance(v, str) and v:
-            return v
-        # Default assumption for MyPaddock: used 
-        return "used"
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+        return "independent"  # closest to original MarketCheck-compatible default
 
     def _call_marketcheck_price(
         self,
@@ -109,11 +102,6 @@ class ValuatorEngine:
         dealer_type: str,
         zip_code: str,
     ) -> Dict[str, Any]:
-        """
-        Perform the HTTP call to MarketCheck.
-
-        Raises requests.HTTPError if status != 200.
-        """
         url = f"{self.base_url}/v2/predict/car/us/marketcheck_price/comparables"
         params = {
             "api_key": self.api_key,
@@ -132,73 +120,94 @@ class ValuatorEngine:
         return resp.json()
 
     def _is_mc_data_usable(self, mc_data: Dict[str, Any]) -> bool:
-        """
-        Decide whether MarketCheck response contains enough info to trust.
-        We require a positive numeric marketcheck_price.
-        """
         if not isinstance(mc_data, dict):
             return False
-
         price = mc_data.get("marketcheck_price")
         try:
             price_f = float(price)
         except (TypeError, ValueError):
             return False
+        return price_f > 0
 
-        if price_f <= 0:
-            return False
-
-        return True
-
-    def _llm_fallback_valuation(self, vehicle: Dict[str, Any], reason: str) -> Optional[ValuationResult]:
+    def _extract_json_object(self, text: str) -> Dict[str, Any]:
         """
-        Simple LLM-based fallback valuation (private-party, US).
-        Returns ONLY if MC fails / returns unusable data.
+        Defensive fallback if the model includes extra text.
+        Tries to find the first {...} JSON object in the response.
+        """
+        text = text.strip()
+        # Fast path: pure JSON
+        try:
+            return json.loads(text)
+        except Exception:
+            pass
+
+        m = re.search(r"\{.*\}", text, flags=re.S)
+        if not m:
+            raise ValueError("No JSON object found in LLM output")
+        return json.loads(m.group(0))
+
+    def _llm_fallback_valuation(self, vehicle: Dict[str, Any], reason: str) -> ValuationResult:
+        """
+        Old-logic-style fallback prompt. Always returns ValuationResult.
+        If the LLM fails, returns price_usd=0.0 with an error comment.
         """
         prompt = f"""
-You are an automotive valuation expert.
+Estimate TODAY'S value of the following vehicle in USD (United States, private-party/used).
 
-Estimate a fair private-party market value in USD for the vehicle below.
-Return ONLY valid JSON with:
-- price_usd (number)
-- explanation (string)
+IMPORTANT RULES:
+- If information is missing or 'unknown', explain its impact in the comment.
+- Consider mileage, age, trim, and condition logically.
+- Output valid JSON only. Do NOT add commentary outside JSON.
+- Use US dollars for price.
 
 Vehicle data:
 {json.dumps(vehicle, ensure_ascii=False, indent=2)}
 
-Context:
-- Sale type: used
-- Market: United States
-"""
+Reason for fallback:
+{reason}
+
+Return JSON exactly in this format:
+{{
+  "price_usd": 12345,
+  "comment": "string describing confidence and missing fields"
+}}
+""".strip()
 
         try:
             resp = self.llm.chat.completions.create(
                 model=self.openai_model,
                 messages=[
-                    {"role": "system", "content": "You estimate used car values conservatively and realistically."},
+                    {"role": "system", "content": "You estimate used vehicle values conservatively and realistically."},
                     {"role": "user", "content": prompt},
                 ],
+                # Key improvement vs your current version: enforce JSON output
+                response_format={"type": "json_object"},
                 temperature=0.2,
             )
 
             content = resp.choices[0].message.content or ""
-            parsed = json.loads(content)
+            parsed = self._extract_json_object(content)
 
             price = float(parsed.get("price_usd", 0.0))
-            explanation = str(parsed.get("explanation", "LLM fallback valuation."))
+            comment = str(parsed.get("comment", "")).strip() or "LLM fallback valuation."
 
             if price <= 0:
-                return None
+                # Old behavior was "shouldn't be 0"; if it is, treat as failure
+                return ValuationResult(
+                    price_usd=0.0,
+                    comment=f"LLM fallback returned non-positive price. Comment: {comment}",
+                    raw_marketcheck=None,
+                )
 
             return ValuationResult(
                 price_usd=price,
-                comment=f"[LLM fallback] {explanation}",
+                comment=f"[LLM fallback] {comment}",
                 raw_marketcheck=None,
             )
 
         except Exception as e:
             return ValuationResult(
-                price_usd=None,
+                price_usd=0.0,
                 comment=f"LLM fallback failed: {e}",
                 raw_marketcheck=None,
             )
@@ -207,24 +216,11 @@ Context:
 
     def evaluate(self, vehicle: Dict[str, Any]) -> ValuationResult:
         """
-        Main entrypoint: given a vehicle dict from your DB, return a ValuationResult.
-
-        Required for MarketCheck:
-          - vin
-          - mileage (miles)
-          - dealer_type (we default to 'independent' if missing)
-          - zip (location)
-
-        Fallback to LLM if:
-          - required fields are missing
-          - MarketCheck call errors
-          - MarketCheck returns 0 / invalid / missing marketcheck_price
+        Returns ValuationResult. Never returns None.
         """
-
         if vehicle is None:
-            # You can keep this as a hard zero or also fallback — your choice.
             return ValuationResult(
-                price_usd=None,
+                price_usd=0.0,
                 comment="Vehicle not found in database.",
                 raw_marketcheck=None,
             )
@@ -261,33 +257,28 @@ Context:
                 reason=f"MarketCheck Price API call failed: {e}",
             )
 
-        # If response is missing / invalid price, fallback
         if not self._is_mc_data_usable(mc_data):
             return self._llm_fallback_valuation(
                 vehicle,
                 reason="MarketCheck returned missing/invalid/zero marketcheck_price",
             )
 
-        # Parse response
-        price = mc_data.get("marketcheck_price")
+        price_float = float(mc_data.get("marketcheck_price"))
+
         msrp = mc_data.get("msrp")
         comps = mc_data.get("comparables", {}) or {}
         num_comps = comps.get("num_found") or len(comps.get("listings", []) or [])
 
-        price_float = float(price)
-
         comment_parts = [
-            f"Price from MarketCheck Price Premium for VIN {vin}.",
+            f"Price from MarketCheck for VIN {vin}.",
             f"Miles: {miles}, zip: {zip_code}, dealer_type: {dealer_type}.",
             f"Comparables used: {num_comps}.",
         ]
         if msrp is not None:
             comment_parts.append(f"MSRP: {msrp} USD.")
 
-        comment = " ".join(comment_parts)
-
         return ValuationResult(
             price_usd=price_float,
-            comment=comment,
+            comment=" ".join(comment_parts),
             raw_marketcheck=mc_data,
         )
