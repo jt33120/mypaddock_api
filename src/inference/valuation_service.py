@@ -66,29 +66,30 @@ class ValuatorEngine:
         return str(v)
 
     def _extract_vin(self, vehicle: Dict[str, Any]) -> Optional[str]:
-        for k in ("vin", "VIN", "vehicle_vin"):
-            if k in vehicle and vehicle[k]:
-                return str(vehicle[k])
+        vin = vehicle.get("vin")
+        if vin:
+            return str(vin)
         return None
+
 
     def _extract_miles(self, vehicle: Dict[str, Any]) -> Optional[int]:
-        for k in ("mileage", "miles", "odometer", "odometer_miles"):
-            v = vehicle.get(k)
-            if v is None:
-                continue
-            try:
-                return int(v)
-            except (TypeError, ValueError):
-                continue
-        return None
+        mileage = vehicle.get("mileage")
+        if mileage is None:
+            return None
+    
+        try:
+            miles = int(mileage)
+        except (TypeError, ValueError):
+            return None
+    
+        return miles if miles >= 0 else None
 
     def _extract_zip(self, vehicle: Dict[str, Any]) -> Optional[str]:
-        # Try various potential keys: adjust as needed for your schema
-        for k in ("zip", "zip_code", "postal_code", "owner_zip", "owner_postal_code"):
-            v = vehicle.get(k)
-            if v:
-                return str(v)
+        zip_code = vehicle.get("zip")
+        if zip_code:
+            return str(zip_code)
         return None
+
 
     def _extract_dealer_type(self, vehicle: Dict[str, Any]) -> str:
         """
@@ -98,8 +99,8 @@ class ValuatorEngine:
         v = vehicle.get("dealer_type")
         if isinstance(v, str) and v:
             return v
-        # Default assumption for MyPaddock: private or independent dealers
-        return "independent"
+        # Default assumption for MyPaddock: used 
+        return "used"
 
     def _call_marketcheck_price(
         self,
@@ -149,7 +150,7 @@ class ValuatorEngine:
 
         return True
 
-    def _llm_fallback_valuation(self, vehicle: Dict[str, Any], reason: str) -> ValuationResult:
+    def _llm_fallback_valuation(self, vehicle: Dict[str, Any], reason: str) -> Optional[ValuationResult]:
         """
         Simple LLM-based fallback valuation (private-party, US).
         Returns ONLY if MC fails / returns unusable data.
@@ -166,9 +167,8 @@ Vehicle data:
 {json.dumps(vehicle, ensure_ascii=False, indent=2)}
 
 Context:
-- Sale type: private party
+- Sale type: used
 - Market: United States
-- Reason for fallback: {reason}
 """
 
         try:
@@ -188,11 +188,7 @@ Context:
             explanation = str(parsed.get("explanation", "LLM fallback valuation."))
 
             if price <= 0:
-                return ValuationResult(
-                    price_usd=0.0,
-                    comment=f"LLM fallback returned non-positive price. Explanation: {explanation}",
-                    raw_marketcheck=None,
-                )
+                return None
 
             return ValuationResult(
                 price_usd=price,
@@ -202,7 +198,7 @@ Context:
 
         except Exception as e:
             return ValuationResult(
-                price_usd=0.0,
+                price_usd=None,
                 comment=f"LLM fallback failed: {e}",
                 raw_marketcheck=None,
             )
@@ -228,7 +224,7 @@ Context:
         if vehicle is None:
             # You can keep this as a hard zero or also fallback — your choice.
             return ValuationResult(
-                price_usd=0.0,
+                price_usd=None,
                 comment="Vehicle not found in database.",
                 raw_marketcheck=None,
             )
