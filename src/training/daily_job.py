@@ -24,6 +24,9 @@ def run_daily_nnm_training() -> Dict[str, Any]:
         learning_rate=1e-4,
     )
 
+    for gamme_id in result.get("gamme_ids", []):
+    update_gamme_params(gamme_id)
+
     return {
         "status": "ok",
         "since_date": since_date_str,
