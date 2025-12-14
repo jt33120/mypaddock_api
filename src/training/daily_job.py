@@ -5,6 +5,7 @@ from typing import Any, Dict, Optional
 
 from src.training.incremental_trainer import train_incremental_on_new_rows
 from src.data.supabase_client import get_supabase_client
+from src.inference.update_gamme_params import update_gamme_params
 
 
 def run_daily_nnm_training() -> Dict[str, Any]:
