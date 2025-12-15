@@ -1,6 +1,6 @@
 # src/training/daily_job.py
 
-from datetime import date, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
 from src.training.incremental_trainer import train_incremental_on_new_rows
@@ -8,51 +8,58 @@ from src.data.supabase_client import get_supabase_client
 from src.inference.update_gamme_params import update_gamme_params
 
 
+def _yesterday_utc_iso() -> str:
+    # Use UTC explicitly to avoid server timezone surprises
+    today_utc = datetime.now(timezone.utc).date()
+    target_date = today_utc - timedelta(days=1)
+    return target_date.isoformat()
+
+
 def run_daily_nnm_training() -> Dict[str, Any]:
     """
-    Train the NNM on all rows from yesterday in vehicle_timeseries.
-
-    We use yesterday because the job runs after midnight (e.g. UTC 10:00),
-    so "yesterday" refers to the complete day in all US time zones.
+    Train the model on rows from yesterday (UTC day).
+    Then update gamme parameters in DB for any gammes touched.
     """
-    target_date = date.today() - timedelta(days=1)
-    since_date_str = target_date.isoformat()
+    since_date_str = _yesterday_utc_iso()
 
     result = train_incremental_on_new_rows(
         since_date=since_date_str,
         epochs=1,
         batch_size=16,
-        learning_rate=1e-4,
+        learning_rate=2e-4,     # slightly higher tends to work better with AdamW
+        # if you adopted the hierarchical trainer, you likely also have:
+        # weight_decay=1e-3,
+        # marketcheck_weight=0.25,
+        # supabase_weight=1.0,
     )
 
-    for gamme_id in result.get("gamme_ids", []):
-    update_gamme_params(gamme_id)
+    # Only update if training actually happened
+    if result.get("status") == "ok":
+        for gamme_id in result.get("gamme_ids", []):
+            update_gamme_params(gamme_id)
 
     return {
         "status": "ok",
         "since_date": since_date_str,
-        "details": result,  # this must be JSON-serializable (dict / list / primitives)
+        "details": result,
     }
 
 
 def log_training_run(payload: Dict[str, Any], error: Optional[str] = None) -> None:
     """
     Insert one row into nnm_training_runs so we can audit training.
-
-    details -> jsonb column
     """
     client = get_supabase_client()
 
     status = "error" if error else payload.get("status", "ok")
     since_date_str = payload.get("since_date")
 
-    # jsonb: we pass a dict directly
     details_obj = payload.get("details", {}) or {}
 
     insert_data = {
         "status": status,
         "since_date": since_date_str,
-        "details": details_obj,
+        "details": details_obj,  # jsonb
         "error_message": error,
     }
 
@@ -64,10 +71,9 @@ def main():
     """Entry point for Railway Cron."""
     print("=== Running Daily NNM Training Job ===")
 
-    # Default payload in case training fails before we get a real result
     payload: Dict[str, Any] = {
         "status": "started",
-        "since_date": (date.today() - timedelta(days=1)).isoformat(),
+        "since_date": _yesterday_utc_iso(),
         "details": {},
     }
 
@@ -80,7 +86,6 @@ def main():
         err_msg = str(e)
         print("Training failed with error:")
         print(err_msg)
-        # log failed run too
         log_training_run(payload, error=err_msg)
         raise
 
