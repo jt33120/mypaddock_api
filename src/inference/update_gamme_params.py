@@ -8,7 +8,7 @@ import json
 import torch
 
 from src.data.supabase_client import get_supabase_client
-from src.training.params_nn_model import HierarchicalParamsNN, OUTPUT_DIM
+from src.training.param_nn_model import HierarchicalParamsNN, OUTPUT_DIM
 
 MODELS_DIR = Path(__file__).resolve().parents[2] / "models"
 MODEL_PATH = MODELS_DIR / "hier_params_nn.pt"
