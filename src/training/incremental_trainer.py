@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader
 
 from .fetch_data import fetch_training_rows_since
 from .dataset import TimeseriesDataset
-from .params_nn_model import HierarchicalParamsNN, INPUT_DIM, OUTPUT_DIM
+from .param_nn_model import HierarchicalParamsNN, INPUT_DIM, OUTPUT_DIM
 from .vocab import Vocab, resize_embedding
 from src.parametric.depreciation_function import price_from_params
 
