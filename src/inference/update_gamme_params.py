@@ -3,93 +3,55 @@
 from __future__ import annotations
 
 from typing import Dict, Any
-
+from pathlib import Path
+import json
 import torch
 
 from src.data.supabase_client import get_supabase_client
-from src.training.encoding import encode_sample
-from src.training.incremental_trainer import ParamsNN, MODEL_PATH
+from src.training.params_nn_model import HierarchicalParamsNN, OUTPUT_DIM
+
+MODELS_DIR = Path(__file__).resolve().parents[2] / "models"
+MODEL_PATH = MODELS_DIR / "hier_params_nn.pt"
+VOCAB_PATH = MODELS_DIR / "gamme_vocab.json"
 
 
-def _load_trained_model() -> ParamsNN:
-    """
-    Load the trained ParamsNN from disk in eval mode.
-    """
-    model = ParamsNN()
-    if MODEL_PATH.exists():
-        state = torch.load(MODEL_PATH, map_location="cpu")
-        model.load_state_dict(state)
+def _load_vocab() -> Dict[str, int]:
+    if not VOCAB_PATH.exists():
+        raise FileNotFoundError(f"Missing vocab file: {VOCAB_PATH}")
+    data = json.loads(VOCAB_PATH.read_text(encoding="utf-8"))
+    stoi = data.get("stoi", {}) or {}
+    return {str(k): int(v) for k, v in stoi.items()}
+
+
+def _load_model(num_gammes: int) -> HierarchicalParamsNN:
+    model = HierarchicalParamsNN(num_gammes=num_gammes)
+    if not MODEL_PATH.exists():
+        raise FileNotFoundError(f"Missing model weights: {MODEL_PATH}")
+    state = torch.load(MODEL_PATH, map_location="cpu")
+    model.load_state_dict(state, strict=False)
     model.eval()
     return model
 
 
-def update_gamme_params(gamme_id: str) -> Dict[str, Any]:
+def get_gamme_base_params(gamme_id: str) -> Dict[str, Any]:
     """
-    For a given gamme_id:
-      - Fetch one representative vehicle + its gamme row from Supabase
-      - Build the full feature vector using encode_sample(...)
-      - Run the ParamsNN to get [delta, alpha, k_a, k_m, L, c]
-      - Update the corresponding row in 'gammes' table.
-
-    Returns a small dict with status and the new params.
+    Return the learned base depreciation params for a gamme_id
+    from the hierarchical model: theta_gamme.
     """
-    client = get_supabase_client()
+    vocab = _load_vocab()
+    if gamme_id not in vocab:
+        return {"status": "unknown_gamme_id_in_vocab", "gamme_id": gamme_id}
 
-    # 1) Fetch one vehicle belonging to this gamme, with nested gamme info
-    resp = (
-        client.table("vehicles")
-        .select(
-            "vehicle_id, gamme_id, type, color, transmission, fuel_type, drivetrain,"
-            "bodystyle, interior_color, features, paddock_score, aftermarket_mods,"
-            "city, state, doors_numbers,"
-            "gammes!inner("
-            "  gamme_id, make, model, year, trim, V0, hp, engine_displacement,"
-            "  engine_configuration, number_of_cylinders, supply_by_country,"
-            "  delta, alpha, k_a, k_m, L, c"
-            ")"
-        )
-        .eq("gamme_id", gamme_id)
-        .limit(1)
-        .execute()
-    )
+    idx = vocab[gamme_id]
+    model = _load_model(num_gammes=max(1, len(vocab)))
 
-    data = resp.data or []
-    if not data:
-        return {
-            "status": "no_vehicle_for_gamme",
-            "gamme_id": gamme_id,
-        }
-
-    row = data[0]
-    v = row
-    g = row["gammes"]
-
-    # 2) Build feature vector
-    nn_input = encode_sample(v, g).unsqueeze(0)  # [1, INPUT_DIM]
-
-    # 3) Load model and predict params
-    model = _load_trained_model()
     with torch.no_grad():
-        params_tensor = model(nn_input)[0]  # [6]
+        theta = model.gamme_base.weight[idx].detach().cpu().tolist()
 
-    delta, alpha, k_a, k_m, L, c = [float(x) for x in params_tensor.tolist()]
+    if len(theta) != OUTPUT_DIM:
+        return {"status": "bad_theta_dim", "gamme_id": gamme_id, "theta_dim": len(theta)}
 
-    # 4) Update the gammes table with the new parameters
-    update_resp = (
-        client.table("gammes")
-        .update(
-            {
-                "delta": delta,
-                "alpha": alpha,
-                "k_a": k_a,
-                "k_m": k_m,
-                "L": L,
-                "c": c,
-            }
-        )
-        .eq("gamme_id", gamme_id)
-        .execute()
-    )
+    delta, alpha, k_a, k_m, L, c = [float(x) for x in theta]
 
     return {
         "status": "ok",
@@ -102,5 +64,40 @@ def update_gamme_params(gamme_id: str) -> Dict[str, Any]:
             "L": L,
             "c": c,
         },
+    }
+
+
+def update_gamme_params(gamme_id: str) -> Dict[str, Any]:
+    """
+    Write theta_gamme (base params) into Supabase gammes table.
+    """
+    client = get_supabase_client()
+
+    res = get_gamme_base_params(gamme_id)
+    if res.get("status") != "ok":
+        return res
+
+    params = res["params"]
+
+    update_resp = (
+        client.table("gammes")
+        .update(
+            {
+                "delta": params["delta"],
+                "alpha": params["alpha"],
+                "k_a": params["k_a"],
+                "k_m": params["k_m"],
+                "L": params["L"],
+                "c": params["c"],
+            }
+        )
+        .eq("gamme_id", gamme_id)
+        .execute()
+    )
+
+    return {
+        "status": "ok",
+        "gamme_id": gamme_id,
+        "params": params,
         "supabase_update": update_resp.data,
     }
