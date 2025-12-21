@@ -6,11 +6,27 @@ from src.data.supabase_client import get_supabase_client
 from src.inference.update_gamme_params import update_gamme_params
 
 
-def _yesterday_utc_iso() -> str:
-    # Use UTC explicitly to avoid server timezone surprises
+def _last_success_since_date_utc_iso(fallback_days: int = 14) -> str:
+    client = get_supabase_client()
+
+    # Get last successful run (most recent)
+    resp = (
+        client.table("nnm_training_runs")
+        .select("since_date")
+        .eq("status", "ok")
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+
+    rows = resp.data or []
+    if rows and rows[0].get("since_date"):
+        return rows[0]["since_date"]
+
+    # Fallback if no prior successful runs exist
     today_utc = datetime.now(timezone.utc).date()
-    target_date = today_utc - timedelta(days=1)
-    return target_date.isoformat()
+    return (today_utc - timedelta(days=fallback_days)).isoformat()
+
 
 
 def _is_biweekly_run() -> bool:
@@ -41,7 +57,7 @@ def run_daily_nnm_training() -> Dict[str, Any]:
             "details": {},
         }
 
-    since_date_str = _yesterday_utc_iso()
+    since_date_str = since_date_str = _last_success_since_date_utc_iso(fallback_days=14)
 
     result = train_incremental_on_new_rows(
         since_date=since_date_str,
