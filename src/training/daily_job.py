@@ -1,5 +1,3 @@
-# src/training/daily_job.py
-
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
@@ -15,19 +13,41 @@ def _yesterday_utc_iso() -> str:
     return target_date.isoformat()
 
 
+def _is_biweekly_run() -> bool:
+    """
+    Run only on odd ISO weeks (biweekly).
+    Cron is expected to be weekly (e.g. Monday 10:00).
+    """
+    now_utc = datetime.now(timezone.utc)
+    iso_week = now_utc.isocalendar().week
+
+    # Change to == 0 if you prefer even weeks instead
+    return iso_week % 2 == 1
+
+
 def run_daily_nnm_training() -> Dict[str, Any]:
     """
     Train the model on rows from yesterday (UTC day).
     Then update gamme parameters in DB for any gammes touched.
     """
+
+    # ---- BIWEEKLY GUARD ----
+    if not _is_biweekly_run():
+        print("Skipping training: not a biweekly (odd ISO week) run.")
+        return {
+            "status": "skipped",
+            "reason": "biweekly_guard",
+            "since_date": None,
+            "details": {},
+        }
+
     since_date_str = _yesterday_utc_iso()
 
     result = train_incremental_on_new_rows(
         since_date=since_date_str,
         epochs=1,
         batch_size=16,
-        learning_rate=2e-4,     # slightly higher tends to work better with AdamW
-        # if you adopted the hierarchical trainer, you likely also have:
+        learning_rate=2e-4,
         # weight_decay=1e-3,
         # marketcheck_weight=0.25,
         # supabase_weight=1.0,
@@ -59,7 +79,7 @@ def log_training_run(payload: Dict[str, Any], error: Optional[str] = None) -> No
     insert_data = {
         "status": status,
         "since_date": since_date_str,
-        "details": details_obj,  # jsonb
+        "details": details_obj,
         "error_message": error,
     }
 
@@ -69,7 +89,7 @@ def log_training_run(payload: Dict[str, Any], error: Optional[str] = None) -> No
 
 def main():
     """Entry point for Railway Cron."""
-    print("=== Running Daily NNM Training Job ===")
+    print("=== Running NNM Training Job (Biweekly) ===")
 
     payload: Dict[str, Any] = {
         "status": "started",
@@ -79,7 +99,7 @@ def main():
 
     try:
         payload = run_daily_nnm_training()
-        print("Training completed successfully.")
+        print("Job finished.")
         print(payload)
         log_training_run(payload)
     except Exception as e:
