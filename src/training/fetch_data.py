@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
 import os
-import time
 import requests
 
 from src.data.supabase_client import get_supabase_client
@@ -19,10 +18,144 @@ def _get_marketcheck_api_key() -> Optional[str]:
     return os.getenv("MARKETCHECK_API_KEY") or os.getenv("VITE_MARKETCHECK_API_KEY")
 
 
+def _clamp_miles(x: float, lo: float = 0.0, hi: float = 300_000.0) -> float:
+    try:
+        v = float(x)
+    except Exception:
+        v = 0.0
+    if v < lo:
+        return lo
+    if v > hi:
+        return hi
+    return v
+
+
+def _mile_targets_forward_heavy(m: float) -> List[float]:
+    """
+    Your requested forward-heavy mileage targets:
+      a few past points + many future points around and beyond m.
+    """
+    m = _clamp_miles(m)
+    targets = [
+        0.5 * m,
+        0.75 * m,
+        m + 1_000,
+        m + 5_000,
+        m + 10_000,
+        m + 50_000,
+        m + 100_000,
+    ]
+    # Deduplicate and clamp
+    out: List[float] = []
+    seen = set()
+    for t in targets:
+        tt = int(_clamp_miles(t))
+        if tt not in seen:
+            seen.add(tt)
+            out.append(float(tt))
+    return out
+
+
+def _pick_comparables_by_targets(
+    comparables: List[Dict[str, Any]],
+    targets: List[float],
+    per_target: List[int],
+    subject_mileage: float,
+) -> List[Dict[str, Any]]:
+    """
+    Select comparables in a forward-heavy way:
+      - For each mileage target, pick up to N nearest unique listings.
+
+    If some targets can't be filled (not enough comps), we redistribute leftover
+    quota into later (more future) targets.
+
+    This works even if MarketCheck doesn't return a perfect mileage spread.
+    """
+    if not comparables:
+        return []
+
+    # Prepare candidates (only those with a valid listing_id + mileage)
+    candidates: List[Dict[str, Any]] = []
+    for c in comparables:
+        lid = c.get("listing_id")
+        miles = c.get("mileage")
+        if not lid:
+            continue
+        try:
+            miles_f = float(miles)
+        except Exception:
+            continue
+        c2 = dict(c)
+        c2["_miles_f"] = miles_f
+        candidates.append(c2)
+
+    if not candidates:
+        return []
+
+    selected: List[Dict[str, Any]] = []
+    selected_ids = set()
+
+    # Helper: pick nearest candidates to a target, excluding already selected
+    def pick_nearest(target: float, k: int) -> Tuple[List[Dict[str, Any]], int]:
+        if k <= 0:
+            return [], 0
+
+        # sort by absolute distance to target
+        pool = [
+            c for c in candidates
+            if c.get("listing_id") not in selected_ids
+        ]
+        if not pool:
+            return [], k
+
+        pool.sort(key=lambda c: abs(c["_miles_f"] - target))
+
+        out_local: List[Dict[str, Any]] = []
+        for c in pool:
+            if len(out_local) >= k:
+                break
+            lid = c.get("listing_id")
+            if lid in selected_ids:
+                continue
+            selected_ids.add(lid)
+            # clean internal helper key
+            c.pop("_miles_f", None)
+            out_local.append(c)
+
+        remaining = k - len(out_local)
+        return out_local, remaining
+
+    # First pass: try to fill each target's quota
+    leftovers: List[int] = []
+    for t, k in zip(targets, per_target):
+        picked, rem = pick_nearest(t, k)
+        selected.extend(picked)
+        leftovers.append(rem)
+
+    # Redistribute any leftovers into later targets (more future)
+    # (priority: last targets first are more "future"; but we add in forward order
+    # by simply looping from the end and picking more near that target)
+    for idx in range(len(targets) - 1, -1, -1):
+        rem = leftovers[idx]
+        if rem <= 0:
+            continue
+        picked, _rem2 = pick_nearest(targets[idx], rem)
+        selected.extend(picked)
+
+    # Optional: ensure we didn't accidentally include "too close to subject" only.
+    # (Keeping as-is: you're explicitly asking for forward-heavy targets.)
+    return selected
+
+
 def _fetch_mc_comparables_for_vehicle(
     base_row: Dict[str, Any],
-    max_similars: int = 100,
+    max_similars: int = 200,  # request a larger pool so we can stratify
 ) -> tuple[Optional[float], List[Dict[str, Any]]]:
+    """
+    Fetch a pool of MarketCheck comparables for a vehicle.
+    NOTE: We keep returning mc_price for compatibility, but we no longer use it
+    to create a subject synthetic row (to avoid doubling).
+    """
 
     api_key = _get_marketcheck_api_key()
     if not api_key:
@@ -69,7 +202,6 @@ def _fetch_mc_comparables_for_vehicle(
         )
         return None, []
 
-    # Build params
     params = {
         "api_key": api_key,
         "vin": vin,
@@ -100,13 +232,12 @@ def _fetch_mc_comparables_for_vehicle(
 
         data = resp.json()
 
-        # ⬇️ NEW: pull price + nested comparables
-        mc_price = data.get("marketcheck_price")
+        mc_price = data.get("marketcheck_price")  # kept for compatibility/logging
         comps_block = data.get("comparables") or {}
         listings = comps_block.get("listings") or []
 
         simplified: List[Dict[str, Any]] = []
-        for lst in listings[:max_similars]:
+        for lst in listings:
             build = lst.get("build", {})
             sim_make = build.get("make") or lst.get("make") or make
             sim_model = build.get("model") or lst.get("model") or model
@@ -115,12 +246,18 @@ def _fetch_mc_comparables_for_vehicle(
             sim_miles = lst.get("miles") or lst.get("mileage") or mileage
             sim_id = lst.get("id") or lst.get("listing_id")
 
+            # Skip if year can't be int
+            try:
+                sim_year_i = int(sim_year)
+            except Exception:
+                continue
+
             simplified.append(
                 {
                     "listing_id": sim_id,
                     "make": sim_make,
                     "model": sim_model,
-                    "year": int(sim_year),
+                    "year": sim_year_i,
                     "trim": sim_trim,
                     "mileage": float(sim_miles) if sim_miles is not None else 0.0,
                     "raw": lst,
@@ -130,11 +267,8 @@ def _fetch_mc_comparables_for_vehicle(
         return mc_price, simplified
 
     except Exception as e:
-        print(
-            f"[MC] comparables exception for vehicle_id={vehicle_id}, vin={vin}: {e}"
-        )
+        print(f"[MC] comparables exception for vehicle_id={vehicle_id}, vin={vin}: {e}")
         return None, []
-
 
 
 def _fetch_mc_price_for_spec(spec: Dict[str, Any]) -> Optional[float]:
@@ -150,7 +284,6 @@ def _fetch_mc_price_for_spec(spec: Dict[str, Any]) -> Optional[float]:
     city = spec.get("city")
     state = spec.get("state")
 
-    # Basic validation before calling MC
     missing = []
     if not vin:
         missing.append("vin")
@@ -179,7 +312,7 @@ def _fetch_mc_price_for_spec(spec: Dict[str, Any]) -> Optional[float]:
         params["city"] = city
         params["state"] = state
 
-    # Optional: enrich with make/model/year/trim; not required but harmless
+    # Optional: enrich with make/model/year/trim
     if spec.get("make"):
         params["make"] = spec["make"]
     if spec.get("model"):
@@ -199,12 +332,7 @@ def _fetch_mc_price_for_spec(spec: Dict[str, Any]) -> Optional[float]:
             return None
 
         data = resp.json()
-        # MarketCheck tends to use these fields for the price
-        price = (
-            data.get("marketcheck_price")
-            or data.get("predicted_price")
-            or data.get("price")
-        )
+        price = data.get("marketcheck_price") or data.get("predicted_price") or data.get("price")
 
         if price is None:
             print(
@@ -216,31 +344,38 @@ def _fetch_mc_price_for_spec(spec: Dict[str, Any]) -> Optional[float]:
         return float(price)
 
     except Exception as e:
-        print(
-            f"[MC] price exception for listing_id={listing_id}, vin={vin}: {e}"
-        )
+        print(f"[MC] price exception for listing_id={listing_id}, vin={vin}: {e}")
         return None
+
 
 def _build_mc_training_row(
     base_row: Dict[str, Any],
     spec: Dict[str, Any],
     mc_price: float,
+    source: str = "marketcheck",
 ) -> Dict[str, Any]:
     """
     Create a synthetic training row (same "shape" as Supabase query result)
-    from a MarketCheck comparable + its MarketCheck Price™.
+    from a MarketCheck comparable or probe + its MarketCheck Price™.
     """
     vehicles = base_row.get("vehicles") or {}
     gammes = (vehicles or {}).get("gammes") or {}
 
     today = datetime.utcnow().date().isoformat()
 
+    # For traceability, use different prefixes
+    prefix = "mc"
+    if source == "mc_probe":
+        prefix = "mc_probe"
+    elif source == "mc_comp":
+        prefix = "mc_comp"
+
     return {
-        "vehicle_id": f"mc_{spec.get('listing_id') or spec.get('make')}_{spec.get('year')}",
+        "vehicle_id": f"{prefix}_{spec.get('listing_id') or spec.get('vin') or spec.get('make')}_{spec.get('year')}",
         "date": today,
         "value": mc_price,
         "mileage": spec.get("mileage", 0.0),
-        "source": "marketcheck",
+        "source": source,
         "vehicles": {
             "vehicle_id": None,
             "gamme_id": vehicles.get("gamme_id"),
@@ -281,8 +416,17 @@ def _build_mc_training_row(
 def fetch_training_rows_since(
     since_date: str,
     use_marketcheck: bool = True,
-    max_mc_vehicles: int = 50,
-    max_similars_per_vehicle: int = 5,
+    # remove the limit by default; keep optional throttle if you want to pass it
+    max_mc_vehicles: Optional[int] = None,
+    # how many comps to REQUEST from MarketCheck (pool size)
+    max_similars_per_vehicle: int = 200,
+    # quotas for your forward-heavy milestones
+    # targets: [0.5m, 0.75m, m+1k, m+5k, m+10k, m+50k, m+100k]
+    per_target_quota: Optional[List[int]] = None,
+    # optional: create "same VIN" future probes at those milestone mileages
+    enable_subject_probes: bool = True,
+    # how many probes per target mileage to add (usually 1 is enough)
+    probes_per_target: int = 1,
 ) -> List[Dict[str, Any]]:
 
     client = get_supabase_client()
@@ -313,76 +457,123 @@ def fetch_training_rows_since(
     if not use_marketcheck:
         return base_rows
 
+    # Default quotas: future-heavy
+    # You suggested something like: few past, some around, more future.
+    # Here we map to the 7 targets:
+    #   0.5m, 0.75m, +1k, +5k, +10k, +50k, +100k
+    # Feel free to tune.
+    if per_target_quota is None:
+        per_target_quota = [2, 2, 5, 5, 10, 10, 10]  # total 44 comps if available
+
     mc_rows: List[Dict[str, Any]] = []
 
     for idx, base_row in enumerate(base_rows):
-        if idx >= max_mc_vehicles:
+        if max_mc_vehicles is not None and idx >= max_mc_vehicles:
             break
 
         vehicles = base_row.get("vehicles") or {}
         gammes = (vehicles or {}).get("gammes") or {}
+
         vin = vehicles.get("vin")
+        base_mileage = base_row.get("mileage")
 
         print(f"[MC] Processing idx={idx}, vehicle_id={base_row.get('vehicle_id')}, vin={vin}")
 
-        # ⬇️ NEW: get BOTH price + comparables
-        mc_price, comparables = _fetch_mc_comparables_for_vehicle(
+        mc_price_subject, comparables_pool = _fetch_mc_comparables_for_vehicle(
             base_row,
             max_similars=max_similars_per_vehicle,
         )
 
-        if mc_price is None and not comparables:
-            print(f"[MC] No MarketCheck data for vehicle_id={base_row.get('vehicle_id')}, vin={vin}")
+        if not comparables_pool and not enable_subject_probes:
+            print(f"[MC] No MarketCheck comparables and probes disabled for vehicle_id={base_row.get('vehicle_id')}, vin={vin}")
             continue
 
-        # 1) Always add ONE row for the subject vehicle using marketcheck_price
-        if mc_price is not None:
-            subject_spec = {
-                "listing_id": None,
-                "make": gammes.get("make"),
-                "model": gammes.get("model"),
-                "year": gammes.get("year"),
-                "trim": gammes.get("trim"),
-                "mileage": base_row.get("mileage", 0.0),
-                "city": vehicles.get("city"),
-                "state": vehicles.get("state"),
-            }
-            subject_row = _build_mc_training_row(base_row, subject_spec, mc_price)
-            mc_rows.append(subject_row)
+        # ---- A) Mileage-stratified comparable selection (forward-heavy) ----
+        selected_comps: List[Dict[str, Any]] = []
+        if comparables_pool and base_mileage is not None:
+            targets = _mile_targets_forward_heavy(float(base_mileage))
+            # Ensure quota list matches target list length
+            qt = per_target_quota[: len(targets)]
+            if len(qt) < len(targets):
+                qt = qt + [qt[-1]] * (len(targets) - len(qt))
 
-        # 2) Optionally augment with synthetic rows from each comparable
-        if not comparables:
-            print(f"[MC] No comparables for vehicle_id={base_row.get('vehicle_id')}, vin={vin}")
-            continue
+            selected_comps = _pick_comparables_by_targets(
+                comparables=comparables_pool,
+                targets=targets,
+                per_target=qt,
+                subject_mileage=float(base_mileage),
+            )
 
-        city = vehicles.get("city")
-        state = vehicles.get("state")
+        # Price each selected comparable and add synthetic rows
+        if selected_comps:
+            city = vehicles.get("city")
+            state = vehicles.get("state")
 
-        for comp in comparables:
-            raw = comp.get("raw") or {}
-        
-            spec = {
-                "listing_id": comp.get("listing_id"),
-                "vin": raw.get("vin"),  # ✅ VIN from comparable listing
-                "make": comp["make"],
-                "model": comp["model"],
-                "year": comp["year"],
-                "trim": comp.get("trim"),
-                "mileage": comp.get("mileage", 0.0),
-                # Location + dealer_type: reuse subject vehicle context
-                "city": city,
-                "state": state,
-                "zip": vehicles.get("zip"),
-                "dealer_type": vehicles.get("dealer_type") or "independent",
-            }
-        
-            mc_price = _fetch_mc_price_for_spec(spec)
-            if mc_price is None:
+            for comp in selected_comps:
+                raw = comp.get("raw") or {}
+
+                spec = {
+                    "listing_id": comp.get("listing_id"),
+                    "vin": raw.get("vin"),  # depends on MC listing including VIN
+                    "make": comp["make"],
+                    "model": comp["model"],
+                    "year": comp["year"],
+                    "trim": comp.get("trim"),
+                    "mileage": comp.get("mileage", 0.0),
+                    # reuse subject context for location + dealer_type
+                    "city": city,
+                    "state": state,
+                    "zip": vehicles.get("zip"),
+                    "dealer_type": vehicles.get("dealer_type") or "independent",
+                }
+
+                comp_price = _fetch_mc_price_for_spec(spec)
+                if comp_price is None:
+                    continue
+
+                mc_row = _build_mc_training_row(base_row, spec, comp_price, source="mc_comp")
+                mc_rows.append(mc_row)
+
+        # ---- B) Subject VIN forward probes (optional) ----
+        # NOTE: This DOES NOT create a "subject synthetic row at current mileage".
+        # It only creates *future/past milestone probe points*.
+        if enable_subject_probes and base_mileage is not None:
+            subj_vin = vehicles.get("vin")
+            if not subj_vin:
+                # can't probe without VIN
                 continue
-        
-            mc_row = _build_mc_training_row(base_row, spec, mc_price)
-            mc_rows.append(mc_row)
 
+            city = vehicles.get("city")
+            state = vehicles.get("state")
+            zip_code = vehicles.get("zip")
+
+            # We'll probe at the same target mileages (including the two past points)
+            targets = _mile_targets_forward_heavy(float(base_mileage))
+
+            for t in targets:
+                # optionally skip "past" targets if you only want future:
+                # if t < float(base_mileage): continue
+
+                for _ in range(max(1, probes_per_target)):
+                    probe_spec = {
+                        "listing_id": None,
+                        "vin": subj_vin,
+                        "make": gammes.get("make"),
+                        "model": gammes.get("model"),
+                        "year": gammes.get("year"),
+                        "trim": gammes.get("trim"),
+                        "mileage": float(t),
+                        "zip": zip_code,
+                        "city": city,
+                        "state": state,
+                        "dealer_type": vehicles.get("dealer_type") or "independent",
+                    }
+
+                    probe_price = _fetch_mc_price_for_spec(probe_spec)
+                    if probe_price is None:
+                        continue
+
+                    probe_row = _build_mc_training_row(base_row, probe_spec, probe_price, source="mc_probe")
+                    mc_rows.append(probe_row)
 
     return base_rows + mc_rows
-
