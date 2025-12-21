@@ -35,11 +35,6 @@ def _clamp_miles(x: float, lo: float = 0.0, hi: float = 300_000.0) -> float:
 # -----------------------------
 
 def _mile_targets_forward_heavy(m: float) -> List[float]:
-    """
-    Forward-heavy comparable targets (7 buckets):
-      - a few past anchors
-      - many future anchors
-    """
     m = _clamp_miles(m)
     targets = [
         0.5 * m,
@@ -61,14 +56,6 @@ def _mile_targets_forward_heavy(m: float) -> List[float]:
 
 
 def _probe_targets_mvp(m: float) -> List[float]:
-    """
-    Probe targets (same VIN) for curve shape without duplicating the base point.
-    We intentionally do NOT include exactly "m" to avoid doubling the base row.
-
-    Default = 11 probes:
-      - 2 past-ish
-      - 9 future-ish
-    """
     m = _clamp_miles(m)
     targets = [
         0.5 * m,
@@ -94,17 +81,12 @@ def _probe_targets_mvp(m: float) -> List[float]:
 
 
 def _allocate_quota(total: int, weights: List[int]) -> List[int]:
-    """
-    Allocate 'total' items across buckets proportionally to integer weights.
-    Remainder is distributed from the most future-heavy buckets (end of list).
-    """
     if total <= 0:
         return [0 for _ in weights]
     wsum = sum(max(0, w) for w in weights) or 1
     base = [int(total * (max(0, w) / wsum)) for w in weights]
     used = sum(base)
     rem = total - used
-    # push remainder to later buckets (future-heavy)
     i = len(base) - 1
     while rem > 0 and i >= 0:
         base[i] += 1
@@ -120,10 +102,6 @@ def _pick_comparables_by_targets(
     targets: List[float],
     per_target: List[int],
 ) -> List[Dict[str, Any]]:
-    """
-    Select comparables to cover mileage buckets:
-      - For each target mileage, pick up to N nearest unique listings.
-    """
     if not comparables:
         return []
 
@@ -177,7 +155,6 @@ def _pick_comparables_by_targets(
         selected.extend(picked)
         leftovers.append(rem)
 
-    # Redistribute leftovers to more future buckets first (end -> start)
     for idx in range(len(targets) - 1, -1, -1):
         rem = leftovers[idx]
         if rem <= 0:
@@ -189,6 +166,61 @@ def _pick_comparables_by_targets(
 
 
 # -----------------------------
+# Grouping helpers
+# -----------------------------
+
+def _vehicle_group_key(row: Dict[str, Any]) -> str:
+    """
+    Stable grouping key for "same vehicle".
+    Priority:
+      1) vehicles.vin (best)
+      2) vehicles.vehicle_id
+      3) base_row.vehicle_id
+    """
+    vehicles = row.get("vehicles") or {}
+    vin = vehicles.get("vin")
+    if vin:
+        return f"vin:{vin}"
+    vvid = vehicles.get("vehicle_id")
+    if vvid:
+        return f"veh:{vvid}"
+    return f"row:{row.get('vehicle_id')}"
+
+
+def _parse_date_iso(d: Any) -> Optional[datetime]:
+    if not d:
+        return None
+    try:
+        # expecting YYYY-MM-DD
+        return datetime.strptime(str(d), "%Y-%m-%d")
+    except Exception:
+        return None
+
+
+def _pick_latest_row(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Pick most recent row by 'date' (YYYY-MM-DD). If parsing fails, fall back
+    to last element.
+    """
+    if not rows:
+        raise ValueError("rows empty")
+    best = rows[-1]
+    best_dt = _parse_date_iso(best.get("date"))
+    for r in rows:
+        dt = _parse_date_iso(r.get("date"))
+        if best_dt is None:
+            # if best unknown, accept any known dt
+            if dt is not None:
+                best = r
+                best_dt = dt
+        else:
+            if dt is not None and dt > best_dt:
+                best = r
+                best_dt = dt
+    return best
+
+
+# -----------------------------
 # MarketCheck I/O
 # -----------------------------
 
@@ -196,12 +228,6 @@ def _fetch_mc_comparables_for_vehicle(
     base_row: Dict[str, Any],
     max_similars: int = 200,
 ) -> tuple[Optional[float], List[Dict[str, Any]]]:
-    """
-    Fetch a pool of MarketCheck comparables for a vehicle.
-
-    Returns (mc_price, comparables_simplified).
-    We keep mc_price for logging/compat but we DO NOT create a subject synthetic row.
-    """
     api_key = _get_marketcheck_api_key()
     if not api_key:
         print("[MC] No MARKETCHECK_API_KEY configured; skipping ALL comparables.")
@@ -393,11 +419,6 @@ def _build_mc_training_row(
     mc_price: float,
     source: str,
 ) -> Dict[str, Any]:
-    """
-    Synthetic training row shaped like Supabase query result.
-    NOTE: Vehicle attributes (transmission/drivetrain/etc.) come from the subject vehicle,
-          because MC comparable payloads may not include your full schema.
-    """
     vehicles = base_row.get("vehicles") or {}
     gammes = (vehicles or {}).get("gammes") or {}
     today = datetime.utcnow().date().isoformat()
@@ -455,33 +476,19 @@ def fetch_training_rows_since(
     use_marketcheck: bool = True,
     max_mc_vehicles: Optional[int] = None,
 
-    # 1) comparables pool size (one call)
     max_similars_per_vehicle: int = 200,
-
-    # 2) hard cap on MarketCheck calls PER vehicle (includes comparables call + price calls)
     max_calls_per_vehicle: int = 80,
 
-    # 3) probes are helpful for curve shape but synthetic; keep modest
     enable_subject_probes: bool = True,
-    desired_probe_points: int = 11,  # uses _probe_targets_mvp then truncates
+    desired_probe_points: int = 11,
 
-    # If you want to completely disable per-comp pricing and just rely on listing prices (if present),
-    # you can wire that here later. For now we keep pricing comps via MC Price™.
     use_listing_price_if_present: bool = False,
 ) -> List[Dict[str, Any]]:
     """
-    Budgeted MarketCheck augmentation optimized for "best learning" under a call cap.
-
-    Calls per vehicle (worst case):
-      1 (/comparables) + K (priced comps) + P (probes)  <= max_calls_per_vehicle
-
-    Default buckets (comparables targets = 7):
-      [0.5m, 0.75m, m+1k, m+5k, m+10k, m+50k, m+100k]
-    We allocate most comp quota to future buckets.
-
-    With max_calls_per_vehicle=80 and desired_probe_points=11:
-      remaining for comps K = 80 - 1 - 11 = 68 comps priced.
-      Total calls ~= 1 + 68 + 11 = 80.
+    NEW behavior:
+      - Always returns ALL base_rows since since_date (real points).
+      - MarketCheck augmentation runs ONLY on the most recent base_row per vehicle (grouped by VIN/vehicle_id).
+        This prevents multiplying probes/comps by daily fetch frequency.
     """
 
     client = get_supabase_client()
@@ -509,30 +516,46 @@ def fetch_training_rows_since(
     for r in base_rows:
         r["source"] = "supabase"
 
-    if not use_marketcheck:
+    if not use_marketcheck or not base_rows:
         return base_rows
+
+    # ---- Pick ONLY the most recent row per vehicle group for MarketCheck augmentation ----
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for r in base_rows:
+        k = _vehicle_group_key(r)
+        grouped.setdefault(k, []).append(r)
+
+    # One "MC anchor row" per vehicle group
+    mc_anchor_rows: List[Dict[str, Any]] = []
+    for k, rows in grouped.items():
+        latest = _pick_latest_row(rows)
+        mc_anchor_rows.append(latest)
+
+    # Optional throttle (applies to number of vehicles, not number of base_rows)
+    if max_mc_vehicles is not None:
+        mc_anchor_rows = mc_anchor_rows[:max_mc_vehicles]
 
     mc_rows: List[Dict[str, Any]] = []
 
-    for idx, base_row in enumerate(base_rows):
-        if max_mc_vehicles is not None and idx >= max_mc_vehicles:
-            break
-
+    # ---- Run MC augmentation only for anchor rows ----
+    for idx, base_row in enumerate(mc_anchor_rows):
         vehicles = base_row.get("vehicles") or {}
         gammes = (vehicles or {}).get("gammes") or {}
         base_mileage = base_row.get("mileage")
         vin = vehicles.get("vin")
 
-        print(f"[MC] Processing idx={idx}, vehicle_id={base_row.get('vehicle_id')}, vin={vin}")
+        print(
+            f"[MC] Processing anchor idx={idx}, group={_vehicle_group_key(base_row)}, "
+            f"vehicle_id={base_row.get('vehicle_id')}, vin={vin}, date={base_row.get('date')}"
+        )
 
         if base_mileage is None:
-            print(f"[MC] Skip: no base mileage for vehicle_id={base_row.get('vehicle_id')}")
+            print(f"[MC] Skip anchor: no mileage for vehicle_id={base_row.get('vehicle_id')}")
             continue
 
-        # ----- Budget tracking (per vehicle) -----
         calls_used = 0
 
-        # 1) One comparables call
+        # 1) One comparables call (pool)
         _mc_price_subject, comparables_pool = _fetch_mc_comparables_for_vehicle(
             base_row,
             max_similars=max_similars_per_vehicle,
@@ -540,7 +563,7 @@ def fetch_training_rows_since(
         calls_used += 1
 
         if not comparables_pool and not enable_subject_probes:
-            print(f"[MC] No comparables and probes disabled for vehicle_id={base_row.get('vehicle_id')}")
+            print(f"[MC] No comparables and probes disabled for anchor vehicle_id={base_row.get('vehicle_id')}")
             continue
 
         # 2) Decide probe targets and comp quota under cap
@@ -548,19 +571,14 @@ def fetch_training_rows_since(
         if enable_subject_probes and vin:
             probe_targets = _probe_targets_mvp(float(base_mileage))[: max(0, desired_probe_points)]
 
-        # Reserve budget for probes first (so curve shape is guaranteed),
-        # but still never exceed the cap.
         probe_budget = min(len(probe_targets), max(0, max_calls_per_vehicle - calls_used))
-        # Remaining goes to priced comps
         comp_budget = max(0, max_calls_per_vehicle - calls_used - probe_budget)
 
         # 3) Select comps by buckets with forward-heavy weighting
         selected_comps: List[Dict[str, Any]] = []
         if comparables_pool and comp_budget > 0:
             targets = _mile_targets_forward_heavy(float(base_mileage))
-            # weights across 7 targets: very future-heavy
-            # buckets: 0.5m, 0.75m, +1k, +5k, +10k, +50k, +100k
-            weights = [1, 1, 2, 2, 3, 3, 3]  # sum=15
+            weights = [1, 1, 2, 2, 3, 3, 3]
             per_target = _allocate_quota(comp_budget, weights)
             selected_comps = _pick_comparables_by_targets(
                 comparables=comparables_pool,
@@ -568,7 +586,7 @@ def fetch_training_rows_since(
                 per_target=per_target,
             )
 
-        # 4) Price selected comps (each is 1 call) until we hit the budget
+        # 4) Price selected comps
         if selected_comps and comp_budget > 0:
             city = vehicles.get("city")
             state = vehicles.get("state")
@@ -577,13 +595,11 @@ def fetch_training_rows_since(
 
             priced_count = 0
             for comp in selected_comps:
-                if priced_count >= comp_budget:
+                if priced_count >= comp_budget or calls_used >= max_calls_per_vehicle:
                     break
 
                 raw = comp.get("raw") or {}
 
-                # Optional future optimization: if listing has a reliable observed price,
-                # you could use it without spending a call.
                 if use_listing_price_if_present:
                     observed = raw.get("price") or raw.get("list_price") or raw.get("internet_price")
                     if observed is not None:
@@ -602,11 +618,11 @@ def fetch_training_rows_since(
                             priced_count += 1
                             continue
                         except Exception:
-                            pass  # fall back to MC price call
+                            pass
 
                 spec = {
                     "listing_id": comp.get("listing_id"),
-                    "vin": raw.get("vin"),  # depends on MC listing including VIN
+                    "vin": raw.get("vin"),
                     "make": comp["make"],
                     "model": comp["model"],
                     "year": comp["year"],
@@ -619,7 +635,7 @@ def fetch_training_rows_since(
                 }
 
                 comp_price = _fetch_mc_price_for_spec(spec)
-                calls_used += 1  # count the call even if it fails (conservative budgeting)
+                calls_used += 1
                 priced_count += 1
 
                 if comp_price is None:
@@ -627,17 +643,13 @@ def fetch_training_rows_since(
 
                 mc_rows.append(_build_mc_training_row(base_row, spec, comp_price, source="mc_comp"))
 
-                if calls_used >= max_calls_per_vehicle:
-                    break
-
-        # 5) Probes (each probe is 1 call) until we hit probe_budget (and cap)
+        # 5) Probes
         if probe_budget > 0 and vin and calls_used < max_calls_per_vehicle:
             city = vehicles.get("city")
             state = vehicles.get("state")
             zip_code = vehicles.get("zip")
             dealer_type = vehicles.get("dealer_type") or "independent"
 
-            used_probes = 0
             for t in probe_targets[:probe_budget]:
                 if calls_used >= max_calls_per_vehicle:
                     break
@@ -658,7 +670,6 @@ def fetch_training_rows_since(
 
                 probe_price = _fetch_mc_price_for_spec(probe_spec)
                 calls_used += 1
-                used_probes += 1
 
                 if probe_price is None:
                     continue
@@ -666,8 +677,8 @@ def fetch_training_rows_since(
                 mc_rows.append(_build_mc_training_row(base_row, probe_spec, probe_price, source="mc_probe"))
 
         print(
-            f"[MC] Done vehicle_id={base_row.get('vehicle_id')} calls_used={calls_used}/"
-            f"{max_calls_per_vehicle} comps_selected={len(selected_comps)} probes_targeted={probe_budget}"
+            f"[MC] Done anchor group={_vehicle_group_key(base_row)} calls_used={calls_used}/{max_calls_per_vehicle} "
+            f"comps_selected={len(selected_comps)} probes_targeted={probe_budget}"
         )
 
     return base_rows + mc_rows
